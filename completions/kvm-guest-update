@@ -1,0 +1,75 @@
+# bash completion for kvm-guest-update                       -*- shell-script -*-
+
+# the supported operating systems: the keys of the PM table in the script
+_kvm_guest_update_oses()
+{
+    local script=$1 line
+    [[ $script == */* ]] || script=$(type -P "$script")
+    if [[ -r $script ]]; then
+        line=$(grep -m 1 '^declare -A PM=' "$script")
+        if [[ $line =~ \((.*)\) ]]; then
+            line=${BASH_REMATCH[1]}
+            while [[ $line =~ \[([^]]+)\] ]]; do
+                printf '%s\n' "${BASH_REMATCH[1]}"
+                line=${line#*"${BASH_REMATCH[0]}"}
+            done
+            return
+        fi
+    fi
+    printf '%s\n' debian opensuse-leap
+}
+
+# the running VMs; the script runs as root, where virsh connects to
+# qemu:///system by default
+_kvm_guest_update_vms()
+{
+    virsh --connect "${LIBVIRT_DEFAULT_URI:-qemu:///system}" list --name 2>/dev/null
+}
+
+_kvm_guest_update()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    COMPREPLY=()
+
+    if [[ $prev == -o ]]; then
+        # a comma-separated list: complete the last element
+        local done= os oses=()
+        [[ $cur == *,* ]] && done=${cur%,*},
+        mapfile -t oses < <(_kvm_guest_update_oses "${COMP_WORDS[0]}")
+        for os in "${oses[@]}"; do
+            [[ ,$done == *,$os,* ]] && continue
+            [[ $os == "${cur##*,}"* ]] && COMPREPLY+=("$done$os")
+        done
+        compopt -o nospace 2>/dev/null
+        [[ ${#COMPREPLY[@]} -eq 1 ]] && compopt +o nospace 2>/dev/null
+        return
+    fi
+
+    # -l lists and exits: nothing to complete after it
+    local i word options=() vms=() vm used=()
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        word=${COMP_WORDS[i]}
+        case $word in
+            -l | -h) return ;;
+            -o) ((i++)) ;;
+            -*) ;;
+            *) used+=("$word") ;;
+        esac
+    done
+
+    if [[ $cur == -* ]]; then
+        # options only before the VM names, as getopts stops at the first one
+        [[ ${#used[@]} -eq 0 ]] || return
+        [[ $COMP_CWORD -eq 1 ]] && options=(-h -l -n -o) || options=(-n -o)
+        mapfile -t COMPREPLY < <(compgen -W "${options[*]}" -- "$cur")
+        return
+    fi
+
+    mapfile -t vms < <(_kvm_guest_update_vms)
+    for vm in "${vms[@]}"; do
+        [[ -n $vm && $vm == "$cur"* ]] || continue
+        [[ " ${used[*]} " == *" $vm "* ]] && continue
+        COMPREPLY+=("$vm")
+    done
+}
+complete -F _kvm_guest_update kvm-guest-update

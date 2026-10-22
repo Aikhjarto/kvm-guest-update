@@ -51,6 +51,17 @@ In each VM:
 install -m 755 kvm-guest-update /usr/local/sbin/
 ```
 
+The bash completion completes the options, the operating systems after
+`-o` (also in a comma-separated list) and the names of the running VMs. It
+reads the operating systems from the `PM` table of the installed script, and
+the VMs from `virsh list` on `qemu:///system` (or `LIBVIRT_DEFAULT_URI`), so
+as a user that is not root it needs read access to libvirt, e.g. through the
+`libvirt` group. The packages install it; otherwise:
+
+```sh
+install -D -m 644 completions/kvm-guest-update /usr/share/bash-completion/completions/kvm-guest-update
+```
+
 Check which VMs would be updated, then do a check-only run:
 
 ```sh
@@ -93,6 +104,14 @@ with the step. `REBOOT REQUIRED`, `CONFIG FILES TO MERGE` and
 system log with the tag `kvm-guest-update`.
 
 The timeout per VM and step is 3600 s (`TIMEOUT` at the top of the script).
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+tests the bash completion.
 
 ## Logs
 
