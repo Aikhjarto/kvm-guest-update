@@ -59,7 +59,11 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(set(self.complete("-")), usage_options())
 
     def test_options_after_an_option(self):
+        self.assertEqual(sorted(self.complete("-o", "debian", "-")), ["-H", "-n", "-o"])
+
+    def test_check_only_and_hooks_exclude_each_other(self):
         self.assertEqual(self.complete("-n", "-"), ["-n", "-o"])
+        self.assertEqual(self.complete("-H", "-"), ["-H", "-o"])
 
     def test_nothing_after_list_or_help(self):
         self.assertEqual(self.complete("-l", ""), [])

@@ -24,6 +24,9 @@ them right away; upgrade those by hand. Afterwards every VM is checked for a
 needed reboot (newer or rebuilt kernel, `/run/reboot-required`,
 `zypper needs-rebooting`). VMs are never rebooted.
 
+Hooks in the VMs can run commands before and after the upgrade, e.g. to stop
+and start a service (see [Hooks](#hooks)).
+
 The upgrade runs in each VM as a transient systemd unit,
 `kvm-guest-update.service`, not as a child of the guest agent. It keeps
 running when the guest agent itself is upgraded and restarted, and when this
@@ -72,13 +75,14 @@ kvm-guest-update -n
 ## Usage
 
 ```
-kvm-guest-update [-n] [-o OS[,OS...]] [VM ...]
+kvm-guest-update [-n | -H] [-o OS[,OS...]] [VM ...]
 kvm-guest-update -l
 ```
 
 | Option | Action |
 |---|---|
-| `-n` | Check only: refresh, download and the check. No upgrade, no `err` message. |
+| `-n` | Check only: refresh, download and the check. No upgrade, no hooks, no `err` message. |
+| `-H` | Run the [hooks](#hooks) also in VMs with nothing to upgrade. Not together with `-n`. |
 | `-o OS` | Only VMs with these operating systems, as reported by the guest agent (`ID` from os-release): `debian`, `opensuse-leap`. Several separated by commas, or `-o` given more than once. |
 | `-l` | List the running VMs, their operating systems and package managers, then exit. |
 | `VM ...` | Only these VMs, by their name in `virsh list`. Default: every running VM with a supported operating system. |
@@ -97,13 +101,65 @@ kvm-guest-update -o debian                # only the Debian VMs
 kvm-guest-update -n Leap_build Debian_omd # check two VMs
 ```
 
-The summary shows for each VM one of: `up to date`, `upgraded N packages`,
-`MANUAL UPGRADE NEEDED` with the expected questions, or `FAILED`/`TIMEOUT`
-with the step. `REBOOT REQUIRED`, `CONFIG FILES TO MERGE` and
-`REPOSITORY PROBLEM` are added where they apply. The same summary goes to the
-system log with the tag `kvm-guest-update`.
+The summary shows for each VM one of: `up to date`, `up to date, hooks run`
+(with `-H`), `upgraded N packages`,
+`MANUAL UPGRADE NEEDED` with the expected questions, `SKIPPED: a pre hook
+failed`, or `FAILED`/`TIMEOUT` with the step. `REBOOT REQUIRED`,
+`CONFIG FILES TO MERGE`, `REPOSITORY PROBLEM` and `HOOK FAILED` are added where
+they apply. The same summary goes to the system log with the tag
+`kvm-guest-update`; the lines of VMs that need a manual upgrade or had a hook
+fail are logged again with priority `err`.
 
 The timeout per VM and step is 3600 s (`TIMEOUT` at the top of the script).
+
+## Hooks
+
+Executable files in these directories **in the VM** run when that VM is
+upgraded:
+
+| Directory | When |
+|---|---|
+| `/etc/kvm-guest-update/pre.d/` | before the upgrade |
+| `/etc/kvm-guest-update/post.d/` | after the upgrade, if it succeeded |
+| `/etc/kvm-guest-update/cleanup.d/` | at the end, always: also when a pre hook, the upgrade or a post hook failed |
+
+- The files of each directory run in name order (C locale: `10-a` before
+  `2-b` before `B` before `a`), as root, with stdin from `/dev/null`. Their
+  output goes to `/var/log/kvm-guest-update.log` in the VM and to the log on
+  the host.
+- **pre:** if a hook fails (exit code other than 0), nothing else runs except
+  the cleanup hooks: no further pre hooks, no upgrade, no post hooks. The
+  summary says `SKIPPED: a pre hook failed`.
+- **post:** if a hook fails, the remaining post hooks are not run. If the
+  upgrade failed, no post hook runs.
+- **cleanup:** all of them run, also when one of them fails.
+- Hooks run only when there is something to upgrade, or with `-H` also when
+  there is nothing to upgrade (then pre, post and cleanup run without an
+  upgrade between them). They never run with `-n`, nor in a VM whose upgrade
+  needs answers to questions (`MANUAL UPGRADE NEEDED`).
+- Each hook gets `KVM_GUEST_UPDATE_STAGE` (`pre`, `post` or `cleanup`) and
+  `KVM_GUEST_UPDATE_STATUS`: `ok`, or for the cleanup hooks what went wrong
+  before them: `pre-failed`, `upgrade-failed` or `post-failed`.
+- Not run: files that are not executable, and leftovers of editors and package
+  managers (`*~`, `*.bak`, `*.dpkg-*`, `*.rpmnew`, `*.rpmsave`, `*.rpmorig`).
+  A hook not owned by root, or writable by group or others, is not run either
+  and counts as failed.
+- A failed hook adds `HOOK FAILED: <stage>/<name>: ...` to the summary, and
+  the VM's summary line is logged with priority `err`.
+- The hooks run within the upgrade's systemd unit, so the timeout (`TIMEOUT`)
+  covers them too.
+
+Example: stop a service for the upgrade and start it again in any case.
+
+```sh
+# /etc/kvm-guest-update/pre.d/10-stop-myapp
+#!/bin/sh
+systemctl stop myapp
+
+# /etc/kvm-guest-update/cleanup.d/10-start-myapp
+#!/bin/sh
+systemctl start myapp
+```
 
 ## Tests
 
@@ -111,7 +167,7 @@ The timeout per VM and step is 3600 s (`TIMEOUT` at the top of the script).
 python3 -m unittest discover -s tests -v
 ```
 
-tests the bash completion.
+tests the bash completion, and the hooks with a fake upgrade.
 
 ## Logs
 

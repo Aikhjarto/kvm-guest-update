@@ -45,13 +45,15 @@ _kvm_guest_update()
         return
     fi
 
-    # -l lists and exits: nothing to complete after it
-    local i word options=() vms=() vm used=()
+    # -l lists and exits: nothing to complete after it; -n and -H exclude each other
+    local i word options=() vms=() vm used=() check= hooks=
     for ((i = 1; i < COMP_CWORD; i++)); do
         word=${COMP_WORDS[i]}
         case $word in
             -l | -h) return ;;
             -o) ((i++)) ;;
+            -n) check=1 ;;
+            -H) hooks=1 ;;
             -*) ;;
             *) used+=("$word") ;;
         esac
@@ -60,7 +62,13 @@ _kvm_guest_update()
     if [[ $cur == -* ]]; then
         # options only before the VM names, as getopts stops at the first one
         [[ ${#used[@]} -eq 0 ]] || return
-        [[ $COMP_CWORD -eq 1 ]] && options=(-h -l -n -o) || options=(-n -o)
+        if [[ $COMP_CWORD -eq 1 ]]; then
+            options=(-h -l -n -H -o)
+        else
+            [[ -n $hooks ]] || options+=(-n)
+            [[ -n $check ]] || options+=(-H)
+            options+=(-o)
+        fi
         mapfile -t COMPREPLY < <(compgen -W "${options[*]}" -- "$cur")
         return
     fi

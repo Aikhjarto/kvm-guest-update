@@ -26,9 +26,19 @@
 # /run/reboot-required, zypper needs-rebooting); VMs are never rebooted by
 # this script.
 #
-# Usage: kvm-guest-update [-n] [-o OS[,OS...]] [VM ...]
+# Hooks: when a VM is upgraded, the executable files in its
+# /etc/kvm-guest-update/pre.d, post.d and cleanup.d are run in name order
+# (C locale): pre.d before the upgrade, post.d after a successful upgrade,
+# cleanup.d at the end, always. A failing pre hook stops everything except the
+# cleanup hooks (no further pre hooks, no upgrade, no post hooks); a failing
+# post hook stops the remaining post hooks. The cleanup hooks all run, also
+# when one of them fails. Not run in check-only mode, nor when there is nothing
+# to upgrade, unless -H is given. Failed hooks are logged with priority err.
+#
+# Usage: kvm-guest-update [-n | -H] [-o OS[,OS...]] [VM ...]
 #        kvm-guest-update -l
 #   -n    check only: refresh, download and the check, no upgrade, no notification
+#   -H    run the hooks also in VMs with nothing to upgrade
 #   -o    only VMs with these operating systems (ID from os-release, see -l)
 #   -l    list the running VMs and their operating systems, and exit
 #   VM    only these VMs (default: every running VM with a supported operating system)
@@ -42,6 +52,7 @@
 
 NAME=kvm-guest-update
 TIMEOUT=3600                     # seconds per VM and step
+HOOKDIR=/etc/$NAME               # in the VM: pre.d, post.d, cleanup.d
 LOGDIR=/var/log/$NAME/$(date +%F_%H%M)
 
 # Supported operating systems: the ID the guest agent reports (from
@@ -57,11 +68,13 @@ usage() {
 }
 
 CHECKONLY=""
+HOOKSALWAYS=""
 LIST=""
 OSES=()
-while getopts nlo:h opt; do
+while getopts nHlo:h opt; do
     case $opt in
         n) CHECKONLY=1 ;;
+        H) HOOKSALWAYS=1 ;;
         l) LIST=1 ;;
         o) IFS=, read -ra os <<< "$OPTARG"; OSES+=("${os[@]}") ;;
         h) usage; exit 0 ;;
@@ -69,6 +82,10 @@ while getopts nlo:h opt; do
     esac
 done
 shift $((OPTIND - 1))
+if [ -n "$CHECKONLY" ] && [ -n "$HOOKSALWAYS" ]; then
+    echo "$NAME: -n and -H exclude each other: a check does not run hooks" >&2
+    exit 2
+fi
 for os in "${OSES[@]}"; do
     [ -n "$os" ] && [ -n "${PM[$os]}" ] && continue
     echo "$NAME: operating system not supported: $os (supported: ${!PM[*]})" >&2
@@ -144,13 +161,13 @@ fi
 exit 0
 EOF
 
-# In the VM: the upgrade; needrestart only lists, it does not ask.
+# In the VM: the upgrade, sets rc; needrestart only lists, it does not ask.
 read -r -d '' 'UPGRADE[apt]' <<'EOF'
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
 echo "=== $(date '+%F %T') apt-get upgrade"
 apt-get -q -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
     --with-new-pkgs upgrade
-echo "EXIT: $?"
+rc=$?
 EOF
 
 # In the VM: is a reboot needed? A newer kernel is installed than the running
@@ -208,7 +225,7 @@ $ZYPPER update --no-recommends --download-only > /dev/null || exit 1
 exit 0
 EOF
 
-# In the VM: the upgrade; changed configuration files are listed afterwards.
+# In the VM: the upgrade, sets rc; changed configuration files are listed afterwards.
 read -r -d '' 'UPGRADE[zypper]' <<'EOF'
 export LC_ALL=C ZYPP_LOCK_TIMEOUT=600
 start=$(mktemp /run/kvm-guest-update.XXXXXX)
@@ -225,7 +242,6 @@ case $rc in 100|101|102|103) rc=0 ;; esac
 cf=$(find /etc -xdev \( -name '*.rpmnew' -o -name '*.rpmsave' \) -newer "$start" 2>/dev/null | tr '\n' ' ')
 [ -n "$cf" ] && echo "CONFIG FILES TO MERGE: $cf"
 rm -f "$start"
-echo "EXIT: $rc"
 EOF
 
 # In the VM: is a reboot needed? A newer kernel is installed than the running
@@ -239,6 +255,66 @@ zypper -n needs-rebooting > /dev/null 2>&1
 [ $? = 102 ] && r="${r:+$r, }zypper needs-rebooting"
 [ -n "$r" ] && echo "REBOOT REQUIRED: $r"
 exit 0
+EOF
+
+### hooks
+
+# In the VM: hooks <stage> [all]: run the executable files in $HOOKDIR/<stage>.d
+# in name order (C locale), with KVM_GUEST_UPDATE_STAGE and
+# KVM_GUEST_UPDATE_STATUS (ok, pre-failed, upgrade-failed, post-failed) in their
+# environment. Stops at the first failing hook unless "all" is given; returns 1
+# if a hook failed. Leftovers of editors and package managers are not run. A
+# hook not owned by the user running it (root) or writable by group or others
+# is not run and counts as failed.
+read -r -d '' HOOKS <<'EOF'
+hooks() {
+    local stage=$1 all=$2 f name rc failed=0
+    local -a files
+    mapfile -t files < <(printf '%s\n' "$HOOKDIR/$stage.d"/* | LC_ALL=C sort)
+    for f in "${files[@]}"; do
+        name=${f##*/}
+        [ -f "$f" ] && [ -x "$f" ] || continue
+        case $name in *~|*.bak|*.dpkg-*|*.rpmnew|*.rpmsave|*.rpmorig) continue ;; esac
+        echo "=== $(date '+%F %T') $stage hook $name"
+        if [ "$(stat -L -c %u "$f")" != "$(id -u)" ] || (( 8#$(stat -L -c %a "$f") & 8#022 )); then
+            echo "HOOK FAILED: $stage/$name: not owned by $(id -un), or writable by group or others"
+            rc=1
+        else
+            KVM_GUEST_UPDATE_STAGE=$stage KVM_GUEST_UPDATE_STATUS=$status "$f" < /dev/null
+            rc=$?
+            [ $rc = 0 ] || echo "HOOK FAILED: $stage/$name: exit code $rc"
+        fi
+        [ $rc = 0 ] && continue
+        failed=1
+        [ -n "$all" ] || break
+    done
+    return $failed
+}
+EOF
+
+# In the VM, with -H when there is nothing to upgrade: the upgrade between the hooks.
+read -r -d '' NOUPGRADE <<'EOF'
+echo "=== $(date '+%F %T') nothing to upgrade, running the hooks only"
+rc=0
+EOF
+
+# In the VM, around the upgrade (pm_upgrade, which sets rc): pre hooks, the
+# upgrade, post hooks, cleanup hooks. Reports the upgrade's exit code, or
+# "pre-hook" if a pre hook failed and nothing was upgraded.
+read -r -d '' HOOKMAIN <<'EOF'
+status=ok
+if hooks pre; then
+    pm_upgrade
+    if [ "$rc" = 0 ]; then
+        hooks post || status=post-failed
+    else
+        status=upgrade-failed
+    fi
+else
+    status=pre-failed rc=pre-hook
+fi
+hooks cleanup all
+echo "EXIT: $rc"
 EOF
 
 questions() {   # questions <pm> <log>: the short list of expected questions for the summary
@@ -293,10 +369,18 @@ put() {     # put <vm> <file> <content>: write <content> to <file> in the VM
     agent "$1" "{\"execute\":\"guest-file-close\",\"arguments\":{\"handle\":$h}}" > /dev/null
 }
 
-upgrade() { # upgrade <vm> <pm> <log>: start the upgrade unit in the VM, wait for it, show its output
-            # and append it to <log>; returns the package manager's exit code, or 3-6 (see the summary)
-    local vm=$1 pm=$2 log=$3 state i out rc
-    put "$vm" "$UPGRADE_SCRIPT" "${UPGRADE[$pm]}" || { echo "cannot write $UPGRADE_SCRIPT" | tee -a "$log"; return 3; }
+upgrade() { # upgrade <vm> <pm> <log> [hooks-only]: start the upgrade unit in the VM, wait for it, show
+            # its output and append it to <log>; with hooks-only, the unit runs only the hooks. Returns 0,
+            # 1 if the package manager failed (its exit code is in PMRC), 7 if a pre hook failed, or 3-6
+            # (see the summary)
+    local vm=$1 pm=$2 log=$3 body=${UPGRADE[$2]} state i out rc
+    [ "$4" = hooks-only ] && body=$NOUPGRADE
+    put "$vm" "$UPGRADE_SCRIPT" "HOOKDIR=$HOOKDIR
+$HOOKS
+pm_upgrade() {
+$body
+}
+$HOOKMAIN" || { echo "cannot write $UPGRADE_SCRIPT" | tee -a "$log"; return 3; }
     run "$vm" "$START" "$log" || return $?
     for ((i = 0; i < TIMEOUT; i += 10)); do
         sleep 10
@@ -312,7 +396,12 @@ upgrade() { # upgrade <vm> <pm> <log>: start the upgrade unit in the VM, wait fo
     out=$(run "$vm" "cat $VMLOG" "$log") || return 3
     sed '/^EXIT: /d' <<< "$out"
     rc=$(sed -n 's/^EXIT: //p' <<< "$out" | tail -1)
-    return "${rc:-5}"
+    case $rc in
+        0)        return 0 ;;
+        pre-hook) return 7 ;;
+        '')       return 5 ;;
+        *)        PMRC=$rc; return 1 ;;
+    esac
 }
 
 interrupted() {
@@ -344,7 +433,7 @@ if [ $# -gt 0 ]; then VMS=("$@"); else VMS=("${RUNNING[@]}"); fi
 mkdir -p "$LOGDIR"
 logger -t $NAME "start${CHECKONLY:+ (check only)}"
 summary=()
-manual=()
+alert=()        # VMs reported with priority err: manual upgrade needed, or a hook failed
 ignored=()
 for vm in "${VMS[@]}"; do
     reason=""
@@ -372,24 +461,30 @@ for vm in "${VMS[@]}"; do
     rc=$?
     n=$(sed -n 's/^UPGRADES: //p' "$log" | tail -1)
     case $rc in
-        0)  if [ "${n:-0}" = 0 ]; then result="up to date"
+        0)  if [ "${n:-0}" = 0 ] && [ -z "$HOOKSALWAYS" ]; then result="up to date"
             elif [ -n "$CHECKONLY" ]; then result="$n packages, no questions expected"
             else
-                upgrade "$vm" "$pm" "$log"
+                only=""
+                [ "${n:-0}" = 0 ] && only=hooks-only
+                upgrade "$vm" "$pm" "$log" $only
                 rc=$?
                 case $rc in
-                    0) result="upgraded $n packages" ;;
+                    0) if [ -n "$only" ]; then result="up to date, hooks run"; else result="upgraded $n packages"; fi ;;
+                    1) result="FAILED: ${UPGRADENAME[$pm]}, exit code $PMRC, see $VMLOG in the VM" ;;
                     3) result="FAILED: guest agent, the upgrade did not start" ;;
                     4) result="TIMEOUT, the upgrade is still running in the VM" ;;
                     5) result="FAILED: no result, see $VMLOG in the VM" ;;
                     6) result="SKIPPED: an upgrade is already running in the VM" ;;
-                    *) result="FAILED: ${UPGRADENAME[$pm]}, exit code $rc, see $VMLOG in the VM" ;;
+                    7) result="SKIPPED: a pre hook failed, nothing upgraded" ;;
+                    *) result="FAILED: exit code $rc" ;;
                 esac
                 cf=$(sed -n 's/^CONFIG FILES TO MERGE: //p' "$log" | tail -1)
                 [ -n "$cf" ] && result="$result, CONFIG FILES TO MERGE: $cf"
+                hf=$(sed -n 's/^HOOK FAILED: //p' "$log" | paste -sd ';' | sed 's/;/; /g')
+                [ -n "$hf" ] && { result="$result, HOOK FAILED: $hf"; alert+=("$vm"); }
             fi ;;
         10) result="MANUAL UPGRADE NEEDED, $n packages, questions expected:$(questions "$pm" "$log")"
-            manual+=("$vm") ;;
+            alert+=("$vm") ;;
         1)  result="FAILED: ${CHECKNAME[$pm]}" ;;
         3)  result="FAILED: guest-exec" ;;
         4)  result="TIMEOUT in the check" ;;
@@ -411,7 +506,7 @@ printf '%s\n' "${summary[@]}"
 [ ${#ignored[@]} -gt 0 ] && echo "not updated: $(printf '%s, ' "${ignored[@]}" | sed 's/, $//')"
 logger -t $NAME "done: $(printf '%s; ' "${summary[@]}")"
 # priority err: for a log monitor to report right away
-[ -z "$CHECKONLY" ] && for vm in "${manual[@]}"; do
+[ -z "$CHECKONLY" ] && for vm in "${alert[@]}"; do
     for s in "${summary[@]}"; do
         [[ $s == "$vm: "* ]] && logger -p user.err -t $NAME "$s"
     done
