@@ -1,0 +1,419 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Thomas Wagner
+#
+# Update the running Debian and openSUSE Leap VMs of a KVM host through the
+# QEMU guest agent. No SSH or password is needed.
+#   Debian: apt-get update and apt-get upgrade (like "apt upgrade": new
+#           dependencies are installed, nothing is removed)
+#   Leap:   zypper refresh and zypper update --no-recommends
+#
+# Before upgrading, each VM is checked for anything the package manager would
+# ask about; the packages are downloaded first. A VM is skipped if
+#   Debian: dpkg would ask about a conffile (changed locally and in the new
+#           package), or a file managed by ucf is changed locally and its
+#           package is upgraded (ucf may ask then). Not detected: debconf
+#           questions (they are answered with their defaults).
+#   Leap:   the dry run reports a dependency problem, packages to be removed,
+#           or a license to agree to. Configuration files never stop zypper:
+#           rpm keeps a changed file and puts the package's version next to
+#           it (.rpmnew), or saves the changed one (.rpmsave); those files are
+#           listed after the upgrade, to merge by hand.
+# Skipped VMs are logged with priority err, for a log monitor to report right
+# away; upgrade those manually.
+#
+# Afterwards each VM is checked for a needed reboot (newer or rebuilt kernel,
+# /run/reboot-required, zypper needs-rebooting); VMs are never rebooted by
+# this script.
+#
+# Usage: kvm-guest-update [-n] [-o OS[,OS...]] [VM ...]
+#        kvm-guest-update -l
+#   -n    check only: refresh, download and the check, no upgrade, no notification
+#   -o    only VMs with these operating systems (ID from os-release, see -l)
+#   -l    list the running VMs and their operating systems, and exit
+#   VM    only these VMs (default: every running VM with a supported operating system)
+#
+# The upgrade runs in each VM as kvm-guest-update.service, independent of this
+# script and of the guest agent: when this script is interrupted, the upgrade
+# in the VM still finishes.
+#
+# Logs: /var/log/kvm-guest-update/<date>/<vm>.log on the host,
+#       /var/log/kvm-guest-update.log in each VM (output of its last upgrade)
+
+NAME=kvm-guest-update
+TIMEOUT=3600                     # seconds per VM and step
+LOGDIR=/var/log/$NAME/$(date +%F_%H%M)
+
+# Supported operating systems: the ID the guest agent reports (from
+# os-release) and the package manager the VM is updated with.
+declare -A PM=([debian]=apt [opensuse-leap]=zypper)
+# per package manager: the scripts run in the VM, and names for the summary
+declare -A CHECK UPGRADE REBOOTCHECK
+declare -A CHECKNAME=([apt]="apt-get update or download" [zypper]="zypper refresh, dry run or download")
+declare -A UPGRADENAME=([apt]="apt-get upgrade" [zypper]="zypper update")
+
+usage() {
+    sed -n 's/^# \{0,1\}//; /^Usage:/,/^  VM/p' "$0"
+}
+
+CHECKONLY=""
+LIST=""
+OSES=()
+while getopts nlo:h opt; do
+    case $opt in
+        n) CHECKONLY=1 ;;
+        l) LIST=1 ;;
+        o) IFS=, read -ra os <<< "$OPTARG"; OSES+=("${os[@]}") ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+for os in "${OSES[@]}"; do
+    [ -n "$os" ] && [ -n "${PM[$os]}" ] && continue
+    echo "$NAME: operating system not supported: $os (supported: ${!PM[*]})" >&2
+    exit 2
+done
+
+[ "$(id -u)" = 0 ] || { echo "$NAME: must be run as root" >&2; exit 1; }
+for c in virsh jq base64 logger; do
+    command -v $c > /dev/null || { echo "$NAME: $c not found" >&2; exit 1; }
+done
+
+agent() {   # agent <vm> <json>: the "return" value of a guest agent command
+    virsh qemu-agent-command "$1" "$2" 2>/dev/null | jq -c '.return'
+}
+
+osinfo() {  # osinfo <vm>: the guest agent's guest-get-osinfo, empty without a guest agent
+    agent "$1" '{"execute":"guest-get-osinfo"}'
+}
+
+pm() {      # pm <os id>: the package manager for this operating system, empty if not supported
+    [ -n "$1" ] && echo "${PM[$1]}"
+}
+
+### apt (Debian)
+
+# In the VM: update, download the upgrades, look for prompts.
+# Exit code 0: no questions expected, 10: questions expected, 1: apt failed.
+read -r -d '' 'CHECK[apt]' <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+APT="apt-get -q -y -o DPkg::Lock::Timeout=600"
+$APT update || exit 1
+# "name version" of each package to install or upgrade
+SIM=$(apt-get -s --with-new-pkgs upgrade)
+mapfile -t PKGS < <(awk '/^Inst /{v=$0; sub(/.*\(/, "", v); split(v, a, " "); print $2, a[1]}' <<< "$SIM")
+echo "UPGRADES: ${#PKGS[@]}"
+# what is updated: name, installed version -> new version (or "new")
+awk '/^Inst /{old = ($3 ~ /^\[/) ? substr($3, 2, length($3) - 2) : "new"; v = $0; sub(/.*\(/, "", v); split(v, a, " "); printf "  %-40s %s -> %s\n", $2, old, a[1]}' <<< "$SIM"
+[ ${#PKGS[@]} -eq 0 ] && exit 0
+$APT -d --with-new-pkgs upgrade > /dev/null || exit 1
+
+md5() { md5sum | cut -d' ' -f1; }
+prompts=0
+names=" "
+for e in "${PKGS[@]}"; do
+    p=${e% *}; v=${e#* }; pn=${p%%:*}; names="$names$pn "
+    deb=$(ls /var/cache/apt/archives/"${pn}_${v//:/%3a}"_*.deb 2>/dev/null | head -1)
+    if [ -z "$deb" ]; then echo "PROMPT: $p $v: package file not found, cannot check"; prompts=1; continue; fi
+    installed=$(dpkg-query -W -f='${Conffiles}\n' "$p" 2>/dev/null)
+    while read -r cf; do
+        [ -e "$cf" ] || continue
+        cur=$(md5 < "$cf")
+        new=$(dpkg-deb --fsys-tarfile "$deb" | tar -xO ".$cf" 2>/dev/null | md5)
+        [ "$cur" = "$new" ] && continue
+        orig=$(awk -v f="$cf" '$1 == f {print $2}' <<< "$installed")
+        if [ -z "$orig" ] || [ "$orig" = newconffile ]; then
+            echo "PROMPT: $pn: $cf exists and differs from the new package's file"; prompts=1
+        elif [ "$cur" != "$orig" ] && [ "$new" != "$orig" ]; then
+            echo "PROMPT: $pn: $cf is changed locally and in the new package"; prompts=1
+        fi
+    done < <(dpkg-deb --ctrl-tarfile "$deb" | tar -xO ./conffiles 2>/dev/null | sed -n 's|^\(remove-on-upgrade \)\{0,1\}\(/.*\)|\2|p')
+done
+
+# files managed by ucf: changed locally, and their package is upgraded
+if [ -r /var/lib/ucf/registry ] && [ -r /var/lib/ucf/hashfile ]; then
+    while read -r up f; do
+        case "$names" in *" $up "*) ;; *) continue ;; esac
+        [ -e "$f" ] || continue
+        h=$(awk -v f="$f" '$2 == f {print $1}' /var/lib/ucf/hashfile)
+        [ -n "$h" ] && [ "$(md5 < "$f")" != "$h" ] && { echo "PROMPT: $up: $f (ucf) is changed locally, may be asked about"; prompts=1; }
+    done < /var/lib/ucf/registry
+fi
+[ $prompts = 1 ] && exit 10
+exit 0
+EOF
+
+# In the VM: the upgrade; needrestart only lists, it does not ask.
+read -r -d '' 'UPGRADE[apt]' <<'EOF'
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+echo "=== $(date '+%F %T') apt-get upgrade"
+apt-get -q -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    --with-new-pkgs upgrade
+echo "EXIT: $?"
+EOF
+
+# In the VM: is a reboot needed? A newer kernel is installed than the running
+# one, the running kernel's package was rebuilt (same name, other build), or
+# /run/reboot-required exists (only created by some packages' hooks on Debian).
+read -r -d '' 'REBOOTCHECK[apt]' <<'EOF'
+r=""
+running=$(uname -r)
+newest=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V | tail -1)
+if [ -n "$newest" ] && [ "$newest" != "$running" ]; then
+    r="kernel $running -> $newest"
+else
+    inst=$(dpkg-query -W -f='${Version}' "linux-image-$running" 2>/dev/null)
+    [ -n "$inst" ] && ! uname -v | grep -qF " $inst " && r="kernel $running rebuilt: $inst installed"
+fi
+if [ -e /run/reboot-required ]; then
+    p=$(tr '\n' ' ' < /run/reboot-required.pkgs 2>/dev/null | sed 's/ *$//')
+    r="${r:+$r, }${p:-/run/reboot-required}"
+fi
+[ -n "$r" ] && echo "REBOOT REQUIRED: $r"
+exit 0
+EOF
+
+### zypper (openSUSE Leap)
+
+# In the VM: refresh, look for questions in a dry run, download the upgrades.
+# Exit code 0: no questions expected, 10: questions expected, 1: zypper failed.
+read -r -d '' 'CHECK[zypper]' <<'EOF'
+export LC_ALL=C ZYPP_LOCK_TIMEOUT=600
+ZYPPER="zypper -n --no-refresh"
+# a repository that cannot be refreshed is skipped, and reported
+if ! REF=$(zypper -n refresh 2>&1); then
+    bad=$(sed -nE "s/^Repository '(.*)' is invalid\.$/\1/p" <<< "$REF" | sort -u | paste -sd, | sed 's/,/, /g')
+    echo "REPOSITORY PROBLEM: ${bad:-$(tail -1 <<< "$REF")}"
+fi
+SIM=$($ZYPPER update --dry-run --no-recommends 2>&1)
+rc=$?
+# number of packages: "176 packages to upgrade, 5 new." or "Nothing to do."
+n=$(grep -E '^[0-9]+ .*(to upgrade|to install|new)' <<< "$SIM" | head -1 | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}')
+echo "UPGRADES: ${n:-0}"
+# what is updated: name, installed version -> new version
+$ZYPPER list-updates 2>/dev/null | awk -F'|' '$1 ~ /^v / {gsub(/ /, "", $3); gsub(/ /, "", $4); gsub(/ /, "", $5); printf "  %-40s %s -> %s\n", $3, $4, $5}'
+new=$(sed -En '/NEW packages? (is|are) going to be installed/,/^$/p' <<< "$SIM" | tail -n +2 | tr -s ' \n' ' ' | sed 's/^ *//; s/ *$//')
+[ -n "$new" ] && echo "  new: $new"
+prompts=0
+grep -E '^Problem:' <<< "$SIM" | sed 's/^/PROMPT: dependencies: /' | grep . && prompts=1
+if grep -q 'going to be REMOVED' <<< "$SIM"; then
+    echo "PROMPT: removals: $(sed -n '/going to be REMOVED/,/^$/p' <<< "$SIM" | tail -n +2 | tr -s ' \n' ' ')"; prompts=1
+fi
+grep -qiE 'agree.*licen[cs]e|licen[cs]e.*(agree|confirm)' <<< "$SIM" && { echo "PROMPT: license: a package needs a license confirmation"; prompts=1; }
+[ $prompts = 1 ] && exit 10
+case $rc in 0|100|101|102|103) ;; *) echo "$SIM" | tail -5; exit 1 ;; esac
+[ "${n:-0}" = 0 ] && exit 0
+$ZYPPER update --no-recommends --download-only > /dev/null || exit 1
+exit 0
+EOF
+
+# In the VM: the upgrade; changed configuration files are listed afterwards.
+read -r -d '' 'UPGRADE[zypper]' <<'EOF'
+export LC_ALL=C ZYPP_LOCK_TIMEOUT=600
+start=$(mktemp /run/kvm-guest-update.XXXXXX)
+echo "=== $(date '+%F %T') zypper update"
+for try in 1 2; do
+    zypper -n --no-refresh update --no-recommends
+    rc=$?
+    # 103: zypper updated itself, and has to run again for the rest
+    [ $rc = 103 ] && [ $try = 1 ] && { echo "=== zypper updated itself, running it again"; continue; }
+    break
+done
+# 100-103 are informational (updates, reboot or restart needed)
+case $rc in 100|101|102|103) rc=0 ;; esac
+cf=$(find /etc -xdev \( -name '*.rpmnew' -o -name '*.rpmsave' \) -newer "$start" 2>/dev/null | tr '\n' ' ')
+[ -n "$cf" ] && echo "CONFIG FILES TO MERGE: $cf"
+rm -f "$start"
+echo "EXIT: $rc"
+EOF
+
+# In the VM: is a reboot needed? A newer kernel is installed than the running
+# one, or zypper needs-rebooting says so (core libraries or services updated).
+read -r -d '' 'REBOOTCHECK[zypper]' <<'EOF'
+r=""
+running=$(uname -r)
+newest=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | grep -v '\.old$' | sort -V | tail -1)
+[ -n "$newest" ] && [ "$newest" != "$running" ] && r="kernel $running -> $newest"
+zypper -n needs-rebooting > /dev/null 2>&1
+[ $? = 102 ] && r="${r:+$r, }zypper needs-rebooting"
+[ -n "$r" ] && echo "REBOOT REQUIRED: $r"
+exit 0
+EOF
+
+questions() {   # questions <pm> <log>: the short list of expected questions for the summary
+    case $1 in
+        apt)    sed -n 's/^PROMPT: \([^:]*\): \([^ ]*\).*/ \1 (\2)/p' "$2" ;;
+        zypper) sed -n 's/^PROMPT: \([^:]*\):.*/ \1/p' "$2" ;;
+    esac | sort -u | tr -d '\n'
+}
+
+### running the upgrade
+
+# In the VM, the upgrade runs as a systemd unit of its own
+# (kvm-guest-update.service), not as a child of the guest agent: an upgrade of
+# qemu-guest-agent stops or restarts the agent, which would kill the upgrade
+# with it. So the upgrade also finishes when this script is interrupted
+# (Ctrl+C, SSH disconnect).
+UPGRADE_SCRIPT=/root/$NAME-upgrade.sh
+VMLOG=/var/log/$NAME.log                     # in the VM: the output of the last upgrade
+read -r -d '' START <<EOF
+if systemctl is-active --quiet $NAME; then echo "an upgrade is already running in this VM, see $VMLOG"; exit 6; fi
+: > $VMLOG
+systemd-run --unit=$NAME --collect --quiet -p StandardOutput=append:$VMLOG -p StandardError=append:$VMLOG \
+    /bin/bash $UPGRADE_SCRIPT
+EOF
+
+run() {     # run <vm> <script> <log>: run <script> in the VM, show its output and append it to <log>; returns its exit code
+            # (the guest agent returns the output when the script has finished)
+    local vm=$1 script=$2 log=$3 pid status i
+    pid=$(agent "$vm" "$(jq -nc --arg c "$script" \
+        '{execute:"guest-exec",arguments:{path:"/bin/bash",arg:["-c",$c],"capture-output":true}}')" | jq -r '.pid // empty')
+    [ -n "$pid" ] || { echo "guest-exec failed" | tee -a "$log"; return 3; }
+    for ((i = 0; i < TIMEOUT; i += 5)); do
+        status=$(agent "$vm" "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}")
+        [ "$(jq -r '.exited' <<< "$status")" = true ] && break
+        sleep 5
+    done
+    if [ "$(jq -r '.exited' <<< "$status")" != true ]; then
+        echo "timeout after $TIMEOUT s, still running in the VM (pid $pid)" | tee -a "$log"
+        return 4
+    fi
+    { jq -r '."out-data" // empty' <<< "$status" | base64 -d
+      jq -r '."err-data" // empty' <<< "$status" | base64 -d; } | tee -a "$log"
+    return "$(jq -r '.exitcode // 5' <<< "$status")"
+}
+
+put() {     # put <vm> <file> <content>: write <content> to <file> in the VM
+    local h
+    h=$(agent "$1" "$(jq -nc --arg p "$2" '{execute:"guest-file-open",arguments:{path:$p,mode:"w"}}')")
+    [[ $h =~ ^[0-9]+$ ]] || return 1
+    agent "$1" "$(jq -nc --argjson h "$h" --arg b "$(printf '%s\n' "$3" | base64 -w0)" \
+        '{execute:"guest-file-write",arguments:{handle:$h,"buf-b64":$b}}')" > /dev/null
+    agent "$1" "{\"execute\":\"guest-file-close\",\"arguments\":{\"handle\":$h}}" > /dev/null
+}
+
+upgrade() { # upgrade <vm> <pm> <log>: start the upgrade unit in the VM, wait for it, show its output
+            # and append it to <log>; returns the package manager's exit code, or 3-6 (see the summary)
+    local vm=$1 pm=$2 log=$3 state i out rc
+    put "$vm" "$UPGRADE_SCRIPT" "${UPGRADE[$pm]}" || { echo "cannot write $UPGRADE_SCRIPT" | tee -a "$log"; return 3; }
+    run "$vm" "$START" "$log" || return $?
+    for ((i = 0; i < TIMEOUT; i += 10)); do
+        sleep 10
+        # empty while the guest agent restarts (when its own package is upgraded): keep waiting
+        state=$(run "$vm" "systemctl is-active $NAME" /dev/null)
+        case $state in inactive|failed) break ;; esac
+    done
+    case $state in
+        inactive|failed) ;;
+        *) echo "timeout after $TIMEOUT s, the upgrade is still running in the VM, see $VMLOG there" | tee -a "$log"
+           return 4 ;;
+    esac
+    out=$(run "$vm" "cat $VMLOG" "$log") || return 3
+    sed '/^EXIT: /d' <<< "$out"
+    rc=$(sed -n 's/^EXIT: //p' <<< "$out" | tail -1)
+    return "${rc:-5}"
+}
+
+interrupted() {
+    echo
+    echo "interrupted${vm:+ while processing $vm}: an upgrade running in the VM continues, its output is in $VMLOG there"
+    logger -t $NAME "interrupted${vm:+ while processing $vm}"
+    exit 130
+}
+
+### main
+
+mapfile -t RUNNING < <(virsh list --name | grep .)
+is_running() { printf '%s\n' "${RUNNING[@]}" | grep -qxF "$1"; }
+
+if [ -n "$LIST" ]; then
+    printf '%-24s %-16s %-8s %s\n' VM OS UPDATE "PRETTY NAME"
+    for vm in "${RUNNING[@]}"; do
+        info=$(osinfo "$vm")
+        os=$(jq -r '.id // empty' <<< "$info")
+        pm=$(pm "$os")
+        printf '%-24s %-16s %-8s %s\n' "$vm" "${os:-(no agent)}" "${pm:--}" "$(jq -r '."pretty-name" // empty' <<< "$info")"
+    done
+    exit 0
+fi
+
+trap interrupted INT TERM HUP
+if [ $# -gt 0 ]; then VMS=("$@"); else VMS=("${RUNNING[@]}"); fi
+
+mkdir -p "$LOGDIR"
+logger -t $NAME "start${CHECKONLY:+ (check only)}"
+summary=()
+manual=()
+ignored=()
+for vm in "${VMS[@]}"; do
+    reason=""
+    if ! is_running "$vm"; then
+        reason="not running"
+    else
+        os=$(osinfo "$vm" | jq -r '.id // empty')
+        pm=$(pm "$os")
+        if [ -z "$os" ]; then reason="no guest agent"
+        elif [ -z "$pm" ]; then reason="$os is not supported"
+        elif [ ${#OSES[@]} -gt 0 ] && ! printf '%s\n' "${OSES[@]}" | grep -qxF "$os"; then reason="$os is not selected"
+        fi
+    fi
+    if [ -n "$reason" ]; then
+        # named VMs: always reported; all VMs: those not selected by -o are left out silently
+        if [ $# -gt 0 ]; then summary+=("$vm: skipped, $reason")
+        elif [[ $reason != *"not selected" ]]; then ignored+=("$vm ($reason)")
+        fi
+        continue
+    fi
+
+    echo "=== $vm ($os)"
+    log=$LOGDIR/$vm.log
+    run "$vm" "${CHECK[$pm]}" "$log"
+    rc=$?
+    n=$(sed -n 's/^UPGRADES: //p' "$log" | tail -1)
+    case $rc in
+        0)  if [ "${n:-0}" = 0 ]; then result="up to date"
+            elif [ -n "$CHECKONLY" ]; then result="$n packages, no questions expected"
+            else
+                upgrade "$vm" "$pm" "$log"
+                rc=$?
+                case $rc in
+                    0) result="upgraded $n packages" ;;
+                    3) result="FAILED: guest agent, the upgrade did not start" ;;
+                    4) result="TIMEOUT, the upgrade is still running in the VM" ;;
+                    5) result="FAILED: no result, see $VMLOG in the VM" ;;
+                    6) result="SKIPPED: an upgrade is already running in the VM" ;;
+                    *) result="FAILED: ${UPGRADENAME[$pm]}, exit code $rc, see $VMLOG in the VM" ;;
+                esac
+                cf=$(sed -n 's/^CONFIG FILES TO MERGE: //p' "$log" | tail -1)
+                [ -n "$cf" ] && result="$result, CONFIG FILES TO MERGE: $cf"
+            fi ;;
+        10) result="MANUAL UPGRADE NEEDED, $n packages, questions expected:$(questions "$pm" "$log")"
+            manual+=("$vm") ;;
+        1)  result="FAILED: ${CHECKNAME[$pm]}" ;;
+        3)  result="FAILED: guest-exec" ;;
+        4)  result="TIMEOUT in the check" ;;
+        *)  result="FAILED: check, exit code $rc" ;;
+    esac
+    repo=$(sed -n 's/^REPOSITORY PROBLEM: //p' "$log" | head -1)
+    [ -n "$repo" ] && result="$result, REPOSITORY PROBLEM: $repo"
+    # after the check, or after the upgrade has finished
+    reboot=$(run "$vm" "${REBOOTCHECK[$pm]}" "$log" | sed -n 's/^REBOOT REQUIRED: //p')
+    [ -n "$reboot" ] && result="$result, REBOOT REQUIRED: $reboot"
+    echo "$result"
+    summary+=("$vm: $result")
+done
+vm=""
+
+echo
+echo "=== Summary${CHECKONLY:+ (check only)}, logs in $LOGDIR"
+printf '%s\n' "${summary[@]}"
+[ ${#ignored[@]} -gt 0 ] && echo "not updated: $(printf '%s, ' "${ignored[@]}" | sed 's/, $//')"
+logger -t $NAME "done: $(printf '%s; ' "${summary[@]}")"
+# priority err: for a log monitor to report right away
+[ -z "$CHECKONLY" ] && for vm in "${manual[@]}"; do
+    for s in "${summary[@]}"; do
+        [[ $s == "$vm: "* ]] && logger -p user.err -t $NAME "$s"
+    done
+done
+exit 0
